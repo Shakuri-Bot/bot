@@ -228,8 +228,38 @@ client.on('guildDelete', async guild => {
         kickLogChannel.send({ embeds: [kickEmbed] });
     }
 
-    // Veritabanından sunucu bilgilerini sil
-    await croxydb.delete(`guild_${guild.id}`);
+    // Sunucuyla ilgili tüm verileri silme işlemi
+    try {
+        const guildId = guild.id;
+        console.log(`Sunucu verilerini temizleme: ${guild.name} (${guildId})`);
+        
+        // Ana sunucu verileri
+        await croxydb.delete(`guild_${guildId}`);
+
+        // Partner sistemi ile ilgili tüm verileri sil
+        await croxydb.delete(`partnerSystem_${guildId}`);
+        await croxydb.delete(`partnerText_${guildId}`);
+        await croxydb.delete(`partnerTimestamps_${guildId}`);
+        await croxydb.delete(`partnerChannel_${guildId}`);
+        await croxydb.delete(`partnerToggle_${guildId}`);
+        await croxydb.delete(`bannedServerCheckToggle_${guildId}`);
+        await croxydb.delete(`partnerCooldown_${guildId}`);
+        
+        // Kullanıcılara ait verilerin silinmesi
+        const userKeys = await croxydb.keysStartingWith(`partnerCount_${guildId}_`);
+        const logKeys = await croxydb.keysStartingWith(`partnerLogs_${guildId}_`);
+        
+        // Verileri paralel olarak sil
+        const deletePromises = [
+            ...userKeys.map(key => croxydb.delete(key)),
+            ...logKeys.map(key => croxydb.delete(key))
+        ];
+        
+        await Promise.all(deletePromises);
+        console.log(`Sunucu verileri temizlendi: ${guild.name} (${guildId}). Toplam ${deletePromises.length} veri silindi.`);
+    } catch (error) {
+        console.error(`Sunucu verileri silinirken hata: ${guild.id}`, error);
+    }
 });
 
 client.on('interactionCreate', async interaction => {
@@ -492,6 +522,39 @@ const partnerButton = new ButtonBuilder()
 
 const partnerRow = new ActionRowBuilder().addComponents(partnerButton);
 
+// Performans için önbellekler
+const partnerProcessCache = new Set();
+
+// Db adapterlerin cache mekanizmasını açık şekilde tanımlayalım
+const dbCache = {
+    set: (key, value) => {
+        try {
+            // Burada önbellek işlemlerini yapıyoruz
+            if (!key) return;
+            // Eğer croxydb bir cache mekanizması içeriyorsa ve erişilebiliyorsa kullan
+            if (croxydb && typeof croxydb.cache === 'object' && croxydb.cache.set) {
+                croxydb.cache.set(key, value);
+            }
+        } catch (error) {
+            console.error('Cache set hatası:', error);
+        }
+    },
+    get: (key) => {
+        try {
+            // Burada önbellek işlemlerini yapıyoruz
+            if (!key) return null;
+            // Eğer croxydb bir cache mekanizması içeriyorsa ve erişilebiliyorsa kullan
+            if (croxydb && typeof croxydb.cache === 'object' && croxydb.cache.get) {
+                return croxydb.cache.get(key);
+            }
+            return null;
+        } catch (error) {
+            console.error('Cache get hatası:', error);
+            return null;
+        }
+    }
+};
+
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
     
@@ -600,24 +663,20 @@ client.on('messageCreate', async message => {
             return; // Mesaj zaten yanıtlanmışsa işlemi durdur
         }
 
-        // Mesaj ID'lerini takip et
-        const processedMessages = client.processedMessages || new Set();
-        if (processedMessages.has(message.id)) {
+        // Performans iyileştirmesi: Tekrar işlem yapılmaması için önbellek kontrolü
+        const cacheKey = `${message.id}`;
+        if (partnerProcessCache.has(cacheKey)) {
             return; // Bu mesaj zaten işlenmişse işlemi durdur
         }
-        processedMessages.add(message.id);
-        client.processedMessages = processedMessages;
-
+        partnerProcessCache.add(cacheKey);
+        
         // Set'in boyutunu kontrol et ve gerekirse temizle
-        if (processedMessages.size > 1000) {
-            // En eski 500 mesajı temizle
-            const messagesToDelete = Array.from(processedMessages).slice(0, 500);
-            messagesToDelete.forEach(id => processedMessages.delete(id));
+        if (partnerProcessCache.size > 1000) {
+            // İlk 500 elemanı temizle
+            const entriesToDelete = Array.from(partnerProcessCache).slice(0, 500);
+            entriesToDelete.forEach(id => partnerProcessCache.delete(id));
         }
 
-        // Partner sayaç işlemlerini takip et
-        const partnerCountProcessed = client.partnerCountProcessed || new Set();
-        
         const partnerToggle = await croxydb.get(`partnerToggle_${message.guild.id}`);
         if (partnerToggle && partnerKeywords.some(keyword => message.content.toLowerCase().includes(keyword.toLowerCase()))) {
             await message.reply({ embeds: [partnerEmbed], components: [partnerRow] }).catch(() => {});
@@ -640,31 +699,33 @@ client.on('messageCreate', async message => {
                     // Her davet linki için benzersiz bir kimlik oluştur
                     const partnerCountKey = `${message.id}_${inviteLink}`;
                     
-                    // Bu partner sayaç işlemi daha önce yapılmış mı kontrol et
-                    if (partnerCountProcessed.has(partnerCountKey)) {
-                        continue; // Bu davet linki zaten işlenmiş, sonraki linke geç
-                    }
-                    
-                    // Partner sayaç işlemini kaydet
-                    partnerCountProcessed.add(partnerCountKey);
-                    client.partnerCountProcessed = partnerCountProcessed;
-                    
-                    // Set'in boyutunu kontrol et ve gerekirse temizle
-                    if (partnerCountProcessed.size > 1000) {
-                        // En eski 500 işlemi temizle
-                        const processesToDelete = Array.from(partnerCountProcessed).slice(0, 500);
-                        processesToDelete.forEach(id => partnerCountProcessed.delete(id));
-                    }
-                    
                     const memberId = message.author.id;
-                    const partnerCount = await croxydb.get(`partnerCount_${message.guild.id}_${memberId}`) || 0;
+                    // Performans için direkt database modülü üzerinden erişiyoruz
+                    
+                    // Kullanıcının mevcut partner sayısını al
+                    const countKey = `partnerCount_${message.guild.id}_${memberId}`;
+                    const partnerCount = await croxydb.get(countKey) || 0;
                     const newPartnerCount = partnerCount + 1;
-                    await croxydb.set(`partnerCount_${message.guild.id}_${memberId}`, newPartnerCount);
-
+                    
+                    // Önce cache'i güncelle - hataya daha dayanıklı yeni yaklaşım
+                    dbCache.set(countKey, newPartnerCount);
+                    
+                    // Veritabanında doğrudan güncelle
+                    const updatePromise = croxydb.set(countKey, newPartnerCount);
+                    
                     // Partnerlik yapılan zamanı loglama
-                    const partnerLogs = await croxydb.get(`partnerLogs_${message.guild.id}_${memberId}`) || [];
+                    const logsKey = `partnerLogs_${message.guild.id}_${memberId}`;
+                    const partnerLogs = await croxydb.get(logsKey) || [];
                     partnerLogs.push({ timestamp: Date.now(), link: inviteLink });
-                    await croxydb.set(`partnerLogs_${message.guild.id}_${memberId}`, partnerLogs);
+                    
+                    // Cache güncelleme - hataya daha dayanıklı
+                    dbCache.set(logsKey, partnerLogs);
+                    
+                    // Veritabanında güncelle
+                    const logUpdatePromise = croxydb.set(logsKey, partnerLogs);
+                    
+                    // Paralel işlem
+                    await Promise.all([updatePromise, logUpdatePromise]);
 
                     // Konsola log ekleyelim
                     console.log(`Partner sayaç: ${message.author.tag} (${memberId}) kullanıcısı için partner sayısı ${newPartnerCount} olarak güncellendi. Link: ${inviteLink}`);
@@ -688,16 +749,19 @@ client.on('messageCreate', async message => {
     }
 });
 
+// Haftalık partner sayılarını sıfırlama
 const resetWeeklyPartners = new CronJob('0 0 * * 1', async () => {
     try {
-        const allKeys = await croxydb.keys();
-        const partnerLogKeys = allKeys.filter(key => key.startsWith('partnerLogs_'));
+        // Prefix ile başlayan anahtarları al
+        const partnerLogKeys = await croxydb.keysStartingWith('partnerLogs_');
         
-        for (const key of partnerLogKeys) {
-            await croxydb.set(key, []);
-        }
+        // Tüm partner loglarını paralel olarak sıfırla
+        const updatePromises = partnerLogKeys.map(key => {
+            return croxydb.set(key, []);
+        });
         
-        console.log('Haftalık partner sayıları sıfırlandı.');
+        await Promise.all(updatePromises);
+        console.log('Haftalık partner sayıları sıfırlandı. Toplam:', partnerLogKeys.length);
     } catch (error) {
         console.error('Haftalık partner sayıları sıfırlanırken hata oluştu:', error);
     }
